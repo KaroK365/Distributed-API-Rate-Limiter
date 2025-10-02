@@ -1,3 +1,7 @@
+
+<img width="1355" height="260" alt="Blank diagram (1)" src="https://github.com/user-attachments/assets/2585eef5-fce4-4ea9-b1e5-561087bde1ae" />
+
+
 # Distributed API Rate Limiter
 
 A high-performance, distributed API rate limiter for Spring Boot applications, leveraging Redis and Lua for atomic, low-latency operations across a horizontally-scaled service cluster.
