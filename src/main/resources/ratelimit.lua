@@ -1,55 +1,74 @@
--- KEYS[1] will be the unique key for the endpoint, e.g., "ratelimit:getLimited"
--- ARGV[1] will be the refillRate
--- ARGV[2] will be the capacity
--- ARGV[3] will be the current timestamp from our Java app
--- ARGV[4] will be the number of tokens to consume (usually 1)
+-- KEYS[1] = The unique key for the rate limit (e.g., "ratelimit:my.endpoint")
+-- ARGV[1] = The refill rate (tokens per second)
+-- ARGV[2] = The capacity of the bucket
+-- ARGV[3] = The current time in milliseconds from the client
+-- ARGV[4] = The number of tokens to consume for this request (usually 1)
 
--- Step 1: Get all the arguments passed from the Java code
-local key = KEYS[1]
-local refill_rate = tonumber(ARGV[1])
+-- Convert ARGV values from strings to numbers for arithmetic
+local rate = tonumber(ARGV[1])
 local capacity = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
 local requested = tonumber(ARGV[4])
 
--- Step 2: Get the current state of the bucket from Redis
--- A Redis Hash is perfect for this. We'll store two fields: "tokens" and "ts" (timestamp)
-local bucket = redis.call('HGETALL', key)
-local last_tokens
-local last_ts
+-- Get the current state of the bucket for the given key
+-- HGETALL returns a list of key-value pairs, e.g., {"tokens", "5", "lastRefillTime", "167...etc"}
+local bucket = redis.call('HGETALL', KEYS[1])
 
--- Step 3: Check if the bucket even exists yet
+local last_tokens
+local last_refill_time
+
+-- If the bucket is empty, it's the first request for this key.
 if #bucket == 0 then
-    -- It's the first request for this key. The bucket is full.
-    last_tokens = capacity
-    last_ts = now
+  -- Initialize the bucket with full capacity and the current time.
+  last_tokens = capacity
+  last_refill_time = now
 else
-    -- The bucket exists. We need to parse the values from the HGETALL result.
-    -- HGETALL returns a list like {"tokens", "5", "ts", "167..."}, so we need to find the values.
-    last_tokens = tonumber(bucket[2]) -- The value for "tokens"
-    last_ts = tonumber(bucket[4])     -- The value for "ts" (timestamp)
+  -- The bucket exists, parse its values.
+  -- HGETALL returns a flat list, so we iterate through it.
+  for i = 1, #bucket, 2 do
+    if bucket[i] == 'tokens' then
+      last_tokens = tonumber(bucket[i+1])
+    elseif bucket[i] == 'lastRefillTime' then
+      last_refill_time = tonumber(bucket[i+1])
+    end
+  end
 end
 
--- Step 4: The refill logic. This is your Java math, now in Lua.
-local time_passed = now - last_ts
-local tokens_to_add = (time_passed * refill_rate) / 1000 -- Note: using integer math!
+-- Calculate the time elapsed since the last refill
+local elapsed = now - last_refill_time
 
-local current_tokens = math.min(capacity, last_tokens + tokens_to_add)
+if elapsed > 0 then
+  -- Calculate how many new tokens should be added based on the elapsed time.
+  -- We use pure integer math to avoid floating point issues.
+  local tokens_to_add = math.floor((elapsed * rate) / 1000)
 
--- Step 5: The decision. Do we have enough tokens?
-local new_tokens
-if current_tokens >= requested then
-    -- Yes, we have enough.
-    new_tokens = current_tokens - requested
+  -- Add the new tokens, but do not exceed the bucket's capacity.
+  local current_tokens = math.min(last_tokens + tokens_to_add, capacity)
 
-    -- Save the new state back to the Redis hash
-    redis.call('HSET', key, 'tokens', new_tokens)
-    redis.call('HSET', key, 'ts', now)
+  -- Check if there are enough tokens to satisfy the request
+  if current_tokens >= requested then
+    -- Yes, there are enough tokens. Consume them.
+    local new_tokens = current_tokens - requested
 
-    -- Return 1 to indicate success
+    -- Update the bucket in Redis with the new token count and the current time.
+    -- Using HSET is better than HMSET which is now deprecated.
+    redis.call('HSET', KEYS[1], 'tokens', new_tokens, 'lastRefillTime', now)
+
+    -- Return 1 to signal success to the client.
     return 1
-else
-    -- No, we don't have enough tokens.
-    -- We don't change anything in Redis.
-    -- Return 0 to indicate failure.
+  else
+    -- Not enough tokens. Do not update anything, just return failure.
+    -- By not updating the lastRefillTime, we ensure the user gets their refill
+    -- based on the last successful consumption or refill check.
     return 0
+  end
+else
+  -- No time has passed (or clock went backwards), just check current tokens.
+  if last_tokens >= requested then
+    local new_tokens = last_tokens - requested
+    redis.call('HSET', KEYS[1], 'tokens', new_tokens, 'lastRefillTime', now)
+    return 1
+  else
+    return 0
+  end
 end
